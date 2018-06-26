@@ -84,6 +84,7 @@ void llvmutil_addoptimizationpasses(PassManagerBase * fpm) {
 
     PassManagerWrapper W(fpm);
     PMB.populateModulePassManager(W);
+    fpm->add(createPromoteMemoryToRegisterPass());
 }
 
 struct SimpleMemoryObject : public MemoryObject {
@@ -375,6 +376,7 @@ void llvmutil_optimizemodule(Module * M, TargetMachine * TM) {
 #endif
 
     PMB.populateModulePassManager(MPM);
+    MPM.add(createPromoteMemoryToRegisterPass());
 
     MPM.run(*M);
 }
