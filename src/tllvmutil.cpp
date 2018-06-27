@@ -24,6 +24,16 @@
 #include "llvm/MC/MCContext.h"
 #endif
 #include "llvm/Support/MemoryObject.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/ADT/Statistic.h"
+#if LLVM_VERSION >= 36
+#include "llvm/Analysis/AssumptionCache.h"
+#endif
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/Transforms/Utils/PromoteMemToReg.h"
+#include "llvm/Transforms/Utils/UnifyFunctionExitNodes.h"
 
 #ifndef _WIN32
 #include <sys/wait.h>
@@ -52,7 +62,7 @@ void llvmutil_addtargetspecificpasses(PassManagerBase * fpm, TargetMachine * TM)
 #else
     fpm->add(createTargetTransformInfoWrapperPass(TM->getTargetIRAnalysis()));
 #endif
-    
+
 #if LLVM_VERSION == 32
     fpm->add(new TargetTransformInfo(TM->getScalarTargetTransformInfo(),
                                      TM->getVectorTargetTransformInfo()));
@@ -70,6 +80,75 @@ public:
             PM->add(P);
     }
 };
+
+// Copied from llvm/lib/Transforms/Utils/Mem2Reg.cpp
+// Modified so it runs on functions marked with OptimizeNone
+namespace {
+  struct PromotePass : public FunctionPass {
+    static char ID; // Pass identification, replacement for typeid
+    PromotePass() : FunctionPass(ID) {
+      initializePromotePassPass(*PassRegistry::getPassRegistry());
+    }
+
+    // runOnFunction - To run this pass, first we calculate the alloca
+    // instructions that are safe for promotion, then we promote each one.
+    //
+    bool runOnFunction(Function &F) override;
+
+    void getAnalysisUsage(AnalysisUsage &AU) const override {
+#if LLVM_VERSION >= 36
+      AU.addRequired<AssumptionCacheTracker>();
+#endif
+      AU.addRequired<DominatorTreeWrapperPass>();
+      AU.setPreservesCFG();
+      // This is a cluster of orthogonal Transforms
+      AU.addPreserved<UnifyFunctionExitNodes>();
+      AU.addPreservedID(LowerSwitchID);
+      AU.addPreservedID(LowerInvokePassID);
+    }
+  };
+}  // end of anonymous namespace
+
+char PromotePass::ID = 0;
+static RegisterPass<PromotePass>
+  X("mem2reg_", "Promote Memory to Register", false, false);
+
+bool PromotePass::runOnFunction(Function &F) {
+  std::vector<AllocaInst*> Allocas;
+
+  BasicBlock &BB = F.getEntryBlock();  // Get the entry node for the function
+
+  bool Changed  = false;
+
+  DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+#if LLVM_VERSION >= 36
+  AssumptionCache &AC =
+      getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
+#endif
+
+  while (1) {
+    Allocas.clear();
+
+    // Find allocas that are safe to promote, by looking at all instructions in
+    // the entry node
+    for (BasicBlock::iterator I = BB.begin(), E = --BB.end(); I != E; ++I)
+      if (AllocaInst *AI = dyn_cast<AllocaInst>(I))       // Is it an alloca?
+        if (isAllocaPromotable(AI))
+          Allocas.push_back(AI);
+
+    if (Allocas.empty()) break;
+
+#if LLVM_VERSION >= 36
+    PromoteMemToReg(Allocas, DT, nullptr, &AC);
+#else
+    PromoteMemToReg(Allocas, DT);
+#endif
+    Changed = true;
+  }
+
+  return Changed;
+}
+
 void llvmutil_addoptimizationpasses(PassManagerBase * fpm) {
     PassManagerBuilder PMB;
     PMB.OptLevel = 3;
@@ -84,7 +163,7 @@ void llvmutil_addoptimizationpasses(PassManagerBase * fpm) {
 
     PassManagerWrapper W(fpm);
     PMB.populateModulePassManager(W);
-    fpm->add(createPromoteMemoryToRegisterPass());
+    fpm->add(new PromotePass());
 }
 
 struct SimpleMemoryObject : public MemoryObject {
@@ -103,7 +182,7 @@ void llvmutil_disassemblefunction(void * data, size_t numBytes, size_t numInst) 
     std::string TripleName = llvm::sys::getProcessTriple();
 #else
     std::string TripleName = llvm::sys::getDefaultTargetTriple();
-#endif    
+#endif
     std::string CPU = llvm::sys::getHostCPUName();
 
     const Target *TheTarget = TargetRegistry::lookupTarget(TripleName, Error);
@@ -150,7 +229,7 @@ void llvmutil_disassemblefunction(void * data, size_t numBytes, size_t numInst) 
     #else
     ArrayRef<uint8_t> Bytes((uint8_t*)data,numBytes);
     #endif
-    
+
     uint64_t addr = (uint64_t)data;
     uint64_t Size;
     fflush(stdout);
@@ -181,9 +260,9 @@ bool llvmutil_emitobjfile(Module * Mod, TargetMachine * TM, bool outputobjectfil
 
     PassManagerT pass;
     llvmutil_addtargetspecificpasses(&pass, TM);
-    
+
     TargetMachine::CodeGenFileType ft = outputobjectfile? TargetMachine::CGFT_ObjectFile : TargetMachine::CGFT_AssemblyFile;
-    
+
     #if LLVM_VERSION <= 36
     formatted_raw_ostream destf(dest);
     #else
@@ -194,7 +273,7 @@ bool llvmutil_emitobjfile(Module * Mod, TargetMachine * TM, bool outputobjectfil
     }
 
     pass.run(*Mod);
-    
+
     destf.flush();
     dest.flush();
 
@@ -209,7 +288,7 @@ struct CopyConnectedComponent : public ValueMaterializer {
     llvmutil_Property copyGlobal;
     void * data;
     ValueToValueMapTy & VMap;
-    
+
     CopyConnectedComponent(Module * dest_, Module * src_, llvmutil_Property copyGlobal_, void * data_, ValueToValueMapTy & VMap_)
     : dest(dest_), src(src_), copyGlobal(copyGlobal_), data(data_), VMap(VMap_) {}
     bool needsFreshlyNamedConstant(GlobalVariable * GV, GlobalVariable * newGV) {
@@ -284,7 +363,7 @@ struct CopyConnectedComponent : public ValueMaterializer {
         }
         if(NamedMDNode * CUN = src->getNamedMetadata("llvm.dbg.cu")) {
             DI = new DIBuilder(*dest);
-            
+
             DICompileUnit CU(CUN->getOperand(0));
             NCU = DI->createCompileUnit(CU.getLanguage(), CU.getFilename(), CU.getDirectory(), CU.getProducer(), CU.isOptimized(), CU.getFlags(), CU.getRunTimeVersion());
         }
@@ -301,8 +380,8 @@ struct CopyConnectedComponent : public ValueMaterializer {
             DISubprogram SP(MD);
             if(MD != NULL && DI != NULL && SP.isSubprogram()) {
     #endif
-           
-                
+
+
                 if(Function * OF = SP.getFunction()) {
                     Function * F = cast<Function>(MapValue(OF,VMap,RF_None,NULL,this));
                     DISubprogram NSP = DI->createFunction(SP.getContext(), SP.getName(), SP.getLinkageName(),
@@ -334,7 +413,7 @@ struct CopyConnectedComponent : public ValueMaterializer {
     Value * materializeValueForMetadata(Value * V) { return NULL; }
     void finalize() {}
 #endif
-    
+
 };
 
 llvm::Module * llvmutil_extractmodulewithproperties(llvm::StringRef DestName, llvm::Module * Src, llvm::GlobalValue ** gvs, size_t N, llvmutil_Property copyGlobal, void * data, llvm::ValueToValueMapTy & VMap) {
@@ -364,19 +443,19 @@ void llvmutil_optimizemodule(Module * M, TargetMachine * TM) {
     MPM.add(createVerifierPass()); //make sure we haven't messed stuff up yet
     MPM.add(createGlobalDCEPass()); //run this early since anything not in the table of exported functions is still in this module
                                      //this will remove dead functions
-    
+
     PassManagerBuilder PMB;
     PMB.OptLevel = 3;
     PMB.SizeLevel = 0;
     PMB.Inliner = createFunctionInliningPass(PMB.OptLevel, 0);
-    
+
 #if LLVM_VERSION >= 35
     PMB.LoopVectorize = true;
     PMB.SLPVectorize = true;
 #endif
 
     PMB.populateModulePassManager(MPM);
-    MPM.add(createPromoteMemoryToRegisterPass());
+    MPM.add(new PromotePass());
 
     MPM.run(*M);
 }
